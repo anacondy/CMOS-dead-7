@@ -1,0 +1,139 @@
+# bump-fallback.yml — keeps the *offline* fallback date current without a human.
+#
+# Why this exists: a cloned repo must not default to a stale fallback. The
+# primary freshness mechanism is in the program itself (a successful SNTP/HTTP
+# sync rewrites TimeKeeper.dat to the current month); this workflow is the
+# secondary one, for distribution: it bumps the compile-time default in
+# src/config.h and the shipped TimeKeeper.dat so a fresh clone is never more
+# than a month behind.
+#
+# Behaviour:
+#   * runs 00:00 on the 1st of each month (UTC), and on workflow_dispatch
+#   * if `git push` is accepted on the default branch -> commits directly
+#   * if the branch is protected -> opens/updates a pull request instead
+#   * a build failure never blocks the bump, but a bump that would go
+#     BACKWARDS is refused outright (see the guard in the patch step)
+#
+# Required permissions: Contents: write (repo Settings > Actions > General >
+# "Read and write" for the workflow token). No PAT needed; if you use a
+# fine-grained PAT as TIMEKEEPER_BUMP_TOKEN it will be preferred for the PR.
+#
+# SPDX-License-Identifier: MIT
+name: bump-fallback
+
+on:
+  schedule:
+    - cron: '0 0 1 * *'      # 00:00 UTC on day 1 of every month
+  workflow_dispatch:
+    inputs:
+      month:
+        description: 'Override as YYYY-MM (default: today, UTC)'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: bump-fallback
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    name: Bump embedded + shipped fallback date
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compute the new fallback date
+        id: d
+        run: |
+          set -euo pipefail
+          if [ -n "${{ inputs.month }}" ]; then
+            Y=${{ inputs.month }}
+            NEW="$Y-01"
+          else
+            NEW="$(date -u +%Y-%m)-01"
+          fi
+          CUR="$(sed -n 's/^#define TK_FALLBACK_DATE "\([^"]*\)".*/\1/p' src/config.h | head -1)"
+          echo "new=$NEW"  >> "$GITHUB_OUTPUT"
+          echo "cur=$CUR"  >> "$GITHUB_OUTPUT"
+          echo "current config.h value : $CUR"
+          echo "proposed value         : $NEW"
+          # ISO dates sort lexicographically, so a plain compare is a date compare.
+          if [[ "$NEW" < "$CUR" ]]; then
+            echo "::error::refusing to move the fallback date backwards ($CUR -> $NEW)"
+            exit 1
+          fi
+          if [ "$NEW" = "$CUR" ]; then
+            echo "no change needed"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Patch src/config.h and TimeKeeper.dat
+        if: steps.d.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          NEW='${{ steps.d.outputs.new }}'
+          Y="${NEW%%-*}"; MD="${NEW#*-}"; M="${MD%%-*}"; D="${MD##*-}"
+
+          # config.h: the five lines the program reads at compile time.
+          sed -i "s/^#define TK_FALLBACK_DATE \".*\"/#define TK_FALLBACK_DATE \"${NEW}\"/" src/config.h
+          sed -i "s/^#define TK_FALLBACK_YEAR .*/#define TK_FALLBACK_YEAR  ${Y}/"   src/config.h
+          sed -i "s/^#define TK_FALLBACK_MONTH .*/#define TK_FALLBACK_MONTH ${M#0}/" src/config.h
+          sed -i "s/^#define TK_FALLBACK_DAY .*/#define TK_FALLBACK_DAY   ${D#0}/"   src/config.h
+
+          # The shipped fallback file, same content the program would write itself.
+          printf '# TimeKeeper offline fallback date\n%s\n' "$NEW" > TimeKeeper.dat
+
+          echo '--- src/config.h (extract) ---'
+          grep -n 'TK_FALLBACK' src/config.h
+          echo '--- TimeKeeper.dat ---'
+          cat TimeKeeper.dat
+
+      - name: Verify the bump still builds and passes the suite
+        if: steps.d.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            gcc-mingw-w64-i686 gcc-mingw-w64-x86-64 \
+            binutils-mingw-w64-i686 binutils-mingw-w64-x86-64
+          make -f Makefile.mingw test
+          make -f Makefile.mingw all
+          # /test inside the Windows binary must still agree with the host suite.
+          if command -v wine64 >/dev/null || command -v wine >/dev/null; then
+            WINEDEBUG=-all timeout 120 wine bin/TimeKeeper64.exe /test || true
+          fi
+
+      - name: Commit and push, or open a pull request
+        if: steps.d.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PAT: ${{ secrets.TIMEKEEPER_BUMP_TOKEN }}
+        run: |
+          set -euo pipefail
+          NEW='${{ steps.d.outputs.new }}'
+          git config user.name  "timekeeper-bot"
+          git config user.email "bot@users.noreply.github.com"
+          git commit -am "chore(fallback): bump embedded fallback date to $NEW" -q
+
+          BR="bump-fallback-$NEW"
+          if [ -n "$PAT" ]; then
+            git remote set-url origin "https://x-access-token:${PAT}@github.com/${GITHUB_REPOSITORY}.git"
+          fi
+          if git push origin "HEAD:${{ github.ref_name }}" 2>/dev/null; then
+            echo "pushed directly to ${{ github.ref_name }}"
+          else
+            echo "direct push refused (branch protection?) - opening a PR"
+            git checkout -q -b "$BR"
+            git push -f origin "$BR"
+            gh pr create --title "chore(fallback): bump fallback date to $NEW" \
+              --body "Automated monthly bump of \`src/config.h\` TK_FALLBACK_DATE and \`TimeKeeper.dat\`. The local self-update in TimeKeeper is still the primary mechanism; this keeps fresh clones current." \
+              --head "$BR" --base "${{ github.ref_name }}" || true
+          fi

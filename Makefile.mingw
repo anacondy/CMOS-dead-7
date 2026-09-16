@@ -1,0 +1,162 @@
+# Makefile.mingw — build TimeKeeper with MinGW-w64 (works on Linux/macOS/Windows).
+#
+#   make -f Makefile.mingw            # both arches -> bin/TimeKeeper32.exe, TimeKeeper64.exe
+#   make -f Makefile.mingw test       # host unit tests (native cc, no cross tools needed)
+#   make -f Makefile.mingw check      # test + build + size/PE audit report
+#   make -f Makefile.mingw SIZE=1     # print the size budget table
+#   make -f Makefile.mingw clean
+#
+# Toolchain overrides: CC32, CC64, WINDRES32, WINDRES64, HOSTCC.
+# SPDX-License-Identifier: MIT
+
+HOSTCC   ?= cc
+CC32     ?= i686-w64-mingw32-gcc
+CC64     ?= x86_64-w64-mingw32-gcc
+WINDRES32?= i686-w64-mingw32-windres
+WINDRES64?= x86_64-w64-mingw32-windres
+OBJDUMP32?= i686-w64-mingw32-objdump
+OBJDUMP64?= x86_64-w64-mingw32-objdump
+STRIP32  ?= i686-w64-mingw32-strip
+STRIP64  ?= x86_64-w64-mingw32-strip
+
+# ---------------------------------------------------------------- flags ----
+# -Os + the section GC is the size story; -static -static-libgcc keeps the DLL
+# list to exactly the four we are allowed. No LTO: it fights windres and buys
+# ~1 KB here, which is not worth an unpredictable build.
+DEFINES  := -D_WIN32_WINNT=0x0601 -DWINVER=0x0601 -DNTDDI_VERSION=0x06010000 \
+            -DWIN32_LEAN_AND_MEAN -DNOMINMAX -DSTRICT -DUNICODE -D_UNICODE
+WARN     := -Wall -Wextra -Wshadow -Wpointer-arith -Wcast-align -Wwrite-strings \
+            -Wconversion -Wno-sign-conversion -Wstrict-prototypes -Wmissing-prototypes \
+            -Wold-style-definition -Wundef -Wunreachable-code -Winit-self
+# -fno-zero-initialized-in-bss is NOT set: the two big scratch buffers
+# (log rotation tail, argv ring) must stay in .bss so they cost nothing on disk.
+OPT      := -Os -fno-ident -fno-asynchronous-unwind-tables -fno-unwind-tables \
+            -ffunction-sections -fdata-sections -fno-stack-protector -fno-tree-loop-distribute-patterns
+CFLAGS   := -std=c11 $(DEFINES) $(WARN) $(OPT) -pipe
+# i586 for the x86 build only: every CPU that can run Windows 7 is at least
+# i686, so the tighter baseline is safe and lets gcc pick shorter push/pop and
+# cmov forms. No effect on x64, which has one instruction set that matters.
+CFLAGS32 := -march=i586
+CFLAGS64 :=
+# The product build compacts the self-test reporting; `make test` keeps prose.
+CFLAGS   += -DTK_SELFTEST_COMPACT
+LDFLAGS  := -static -static-libgcc -Wl,--gc-sections,--build-id=none,--nxcompat,--dynamicbase,--file-alignment,512
+LDLIBS   := -lkernel32 -ladvapi32 -lws2_32 -lwininet -luser32
+
+# TK_NOCRT: skip MinGW's CRT start-up objects (see src/crt_start.c). Set
+# NOCRT=0 to link the conventional CRT if you are debugging something odd.
+NOCRT    ?= 1
+ifeq ($(NOCRT),1)
+CFLAGS   += -DTK_NOCRT
+LDFLAGS  += -nostartfiles
+SRC      := src/crt_start.c
+else
+SRC      :=
+endif
+
+SRC      := $(SRC) src/tklibc.c src/main.c src/timeutil.c src/verdict.c src/selftest.c src/sntp.c \
+            src/sntp_proto.c src/http_date.c src/fallback.c src/fallback_proto.c \
+            src/privilege.c src/log.c src/log_rotate.c src/winutil.c src/install.c
+HDR      := $(wildcard src/*.h) tests/vectors.h
+OBJ32    := $(SRC:src/%.c=build/32/%.o)
+OBJ64    := $(SRC:src/%.c=build/64/%.o)
+BIN      := bin/TimeKeeper32.exe bin/TimeKeeper64.exe
+
+MAXSIZE  := 153600   # hard limit from the spec, in bytes
+TGT      := 81920    # target
+
+.PHONY: all test check clean dirs size help 32 64
+.SUFFIXES:
+
+all: dirs $(BIN) size
+
+32: dirs bin/TimeKeeper32.exe size
+64: dirs bin/TimeKeeper64.exe size
+
+# ---------------------------------------------------------------- rules ----
+dirs:
+	@mkdir -p build/32 build/64 bin
+
+build/32/%.o: src/%.c $(HDR)
+	@mkdir -p build/32
+	$(CC32) $(CFLAGS) $(CFLAGS32) -Isrc -I. -c $< -o $@
+
+build/64/%.o: src/%.c $(HDR)
+	@mkdir -p build/64
+	$(CC64) $(CFLAGS) $(CFLAGS64) -Isrc -I. -c $< -o $@
+
+# The manifest is staged into the build directory because windres resolves the
+# .rc's relative data paths against the *current directory*, while rc.exe
+# resolves them against the .rc's own directory.
+build/32/version.o: src/version.rc src/app.manifest $(HDR)
+	@cp src/app.manifest build/32/app.manifest
+	cd build/32 && $(WINDRES32) -I../../src -I. -D_WIN32_WINNT=0x0601 \
+	  --output-format=coff ../../src/version.rc version.o
+
+build/64/version.o: src/version.rc src/app.manifest $(HDR)
+	@cp src/app.manifest build/64/app.manifest
+	cd build/64 && $(WINDRES64) -I../../src -I. -D_WIN32_WINNT=0x0601 \
+	  --output-format=coff ../../src/version.rc version.o
+
+bin/TimeKeeper32.exe: $(OBJ32) build/32/version.o
+	$(CC32) $(CFLAGS) $(CFLAGS32) -Wl,--subsystem,windows -Wl,--major-os-version,6 -Wl,--minor-os-version,1 \
+	  -Wl,--major-subsystem-version,6 -Wl,--minor-subsystem-version,1 \
+	  $(LDFLAGS) -o $@ $(OBJ32) build/32/version.o $(LDLIBS)
+	-$(STRIP32) --strip-all $@
+
+bin/TimeKeeper64.exe: $(OBJ64) build/64/version.o
+	$(CC64) $(CFLAGS) $(CFLAGS64) -Wl,--subsystem,windows -Wl,--major-os-version,6 -Wl,--minor-os-version,1 \
+	  -Wl,--major-subsystem-version,6 -Wl,--minor-subsystem-version,1 \
+	  $(LDFLAGS) -o $@ $(OBJ64) build/64/version.o $(LDLIBS)
+	-$(STRIP64) --strip-all $@
+
+# ------------------------------------------------------------ host tests ----
+TESTSRC := tests/host_test.c src/timeutil.c src/verdict.c src/selftest.c src/log_rotate.c \
+           src/sntp_proto.c src/fallback_proto.c src/tklibc.c
+build/host_test: $(TESTSRC) $(HDR)
+	@mkdir -p build
+	$(HOSTCC) -std=c11 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
+	  -Wall -Wextra -Wshadow -fno-tree-loop-distribute-patterns -Isrc -I. $(TESTSRC) -o $@
+
+test: build/host_test
+	@./build/host_test
+
+# Plain build without sanitizers, for coverage-insensitive environments.
+build/host_test_plain: $(TESTSRC) $(HDR)
+	@mkdir -p build
+	$(HOSTCC) -std=c11 -O1 -Wall -Wextra -Isrc -I. $(TESTSRC) -o $@
+
+test-plain: build/host_test_plain
+	@./build/host_test_plain
+
+# ---------------------------------------------------------------- audit ----
+size:
+	@printf '%-26s %10s %10s %8s\n' artifact bytes target verdict; \
+	pass=1; \
+	for f in $(BIN); do \
+	  if [ -f "$$f" ]; then \
+	    s=$$(stat -c%s "$$f" 2>/dev/null || stat -f%z "$$f"); \
+	    if [ "$$s" -le $(MAXSIZE) ]; then v=PASS; else v=OVER; pass=0; fi; \
+	    printf '%-26s %10s %10s %8s\n' "$$f" "$$s" $(TGT) "$$v"; \
+	  else printf '%-26s %10s\n' "$$f" missing; pass=0; fi; \
+	done; \
+	if [ "$$pass" = 1 ]; then echo "size budget: OK"; else exit 1; fi
+
+# The PE auditor is the gate that matters: it reads subsystem, OS version, the
+# import list, the embedded manifest and the size out of the linked artifact, so
+# none of those promises can rot silently in a later commit.
+audit: all
+	@python3 tests/pe_audit.py bin/TimeKeeper32.exe bin/TimeKeeper64.exe \
+	  --require-manifest --require-versioninfo --max-size $(MAXSIZE)
+
+# End-to-end: runs the real .exe under Wine against local SNTP/HTTP fixtures.
+# Needs wine; the clock-moving half needs sudo.
+acceptance: all
+	@bash tests/acceptance.sh
+
+
+
+check: test all audit
+
+clean:
+	rm -rf build bin/TimeKeeper32.exe bin/TimeKeeper64.exe

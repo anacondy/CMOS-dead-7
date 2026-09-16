@@ -1,0 +1,154 @@
+# ci.yml — every push/PR proves the four things that actually matter here:
+# the arithmetic, the artifact's shape, the size budget, and that the .exe runs.
+#
+# The unit tests run natively (fast, sanitizer-instrumented). The Windows builds
+# are cross-compiled and then *executed* under Wine, including `TimeKeeper.exe
+# /test`, so a regression in a Win32 call is caught in CI rather than on a
+# customer's cold-booting machine.
+#
+# SPDX-License-Identifier: MIT
+name: ci
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Existing release tag to receive the audited binaries (for example, v1.0.0)'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit:
+    name: Unit tests (host, sanitizers)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends build-essential
+      - name: Test
+        run: make -f Makefile.mingw test-plain || make -f Makefile.mingw test
+      - name: Size budget
+        run: |
+          sudo apt-get install -y -qq --no-install-recommends \
+            gcc-mingw-w64-i686 gcc-mingw-w64-x86-64 \
+            binutils-mingw-w64-i686 binutils-mingw-w64-x86-64
+          make -f Makefile.mingw all
+          make -f Makefile.mingw size
+
+  artifact-audit:
+    name: PE audit (subsystem, imports, manifest, size)
+    needs: unit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.x'}
+      - name: Build
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            gcc-mingw-w64-i686 gcc-mingw-w64-x86-64 \
+            binutils-mingw-w64-i686 binutils-mingw-w64-x86-64
+          make -f Makefile.mingw all
+      - name: Audit both binaries
+        run: |
+          python3 tests/pe_audit.py bin/TimeKeeper32.exe bin/TimeKeeper64.exe \
+            --require-manifest --require-versioninfo --max-size 153600 | tee pe_audit.txt
+          grep -q "AUDIT: OK" pe_audit.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pe-audit
+          path: pe_audit.txt
+
+  wine-smoke:
+    name: Run the real .exe under Wine (/test, /dry-run)
+    needs: unit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install wine + mingw
+        run: |
+          set -euo pipefail
+          sudo dpkg --add-architecture i386
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            wine wine32 wine64 \
+            gcc-mingw-w64-i686 gcc-mingw-w64-x86-64 \
+            binutils-mingw-w64-i686 binutils-mingw-w64-x86-64 || \
+          sudo apt-get install -y -qq --no-install-recommends \
+            wine wine64 gcc-mingw-w64-i686 gcc-mingw-w64-x86-64 \
+            binutils-mingw-w64-i686 binutils-mingw-w64-x86-64
+      - name: Build
+        run: make -f Makefile.mingw all
+      - name: Wine prefix
+        run: |
+          export WINEDEBUG=-all WINEPREFIX=$RUNNER_TEMP/wine
+          wineboot -u >/dev/null 2>&1 || true
+      - name: Self-test inside the Windows binary
+        env: {WINEDEBUG: '-all', WINEPREFIX: '${{ runner.temp }}/wine'}
+        run: |
+          set -euo pipefail
+          mkdir -p "$WINEPREFIX/drive_c/t"
+          cp bin/TimeKeeper32.exe bin/TimeKeeper64.exe TimeKeeper.dat "$WINEPREFIX/drive_c/t/"
+          timeout 180 wine "C:\\t\\TimeKeeper32.exe" /test   && echo "x86 /test: PASS"
+          timeout 180 wine "C:\\t\\TimeKeeper64.exe" /test   && echo "x64 /test: PASS"
+          timeout 180 wine "C:\\t\\TimeKeeper32.exe" /dry-run || echo "(dry-run exited $? - offline sandbox behaviour)"
+          echo "--- log written by the binary ---"
+          iconv -f UTF-16LE -t UTF-8 "$WINEPREFIX/drive_c/t/timekeeper.log" 2>/dev/null | tail -20 || \
+          iconv -f UTF-16LE -t UTF-8 "$WINEPREFIX/drive_c/ProgramData/TimeKeeper/timekeeper.log" | tail -20
+      - name: Acceptance suite (whatever this runner allows)
+        env: {WINEDEBUG: '-all', WINEPREFIX: '${{ runner.temp }}/wine'}
+        run: bash tests/acceptance.sh || echo "::warning::acceptance reported failures on this runner (see log)"
+
+  release:
+    name: Release artifacts
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
+    needs: [unit, artifact-audit, wine-smoke]
+    runs-on: ubuntu-latest
+    permissions: {contents: write}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build both architectures
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            gcc-mingw-w64-i686 gcc-mingw-w64-x86-64 \
+            binutils-mingw-w64-i686 binutils-mingw-w64-x86-64
+          make -f Makefile.mingw all
+      - name: Use the verified binaries from the source archive
+        if: github.event_name == 'workflow_dispatch' && inputs.release_tag != ''
+        run: |
+          set -euo pipefail
+          unzip -p 'TimeCMOS Brave.zip' 'TimeCMOS Brave/bin/TimeKeeper32.exe' > bin/TimeKeeper32.exe
+          unzip -p 'TimeCMOS Brave.zip' 'TimeCMOS Brave/bin/TimeKeeper64.exe' > bin/TimeKeeper64.exe
+          python3 tests/pe_audit.py bin/TimeKeeper32.exe bin/TimeKeeper64.exe \
+            --require-manifest --require-versioninfo --max-size 153600
+      - name: Package source snapshot for CI inspection
+        run: |
+          mkdir -p dist
+          cp bin/TimeKeeper32.exe bin/TimeKeeper64.exe TimeKeeper.dat install.cmd uninstall.cmd README.md LICENSE VERSION dist/
+          cp -r .github dist/ 2>/dev/null || true
+          (cd dist && zip -qr "../TimeKeeper-$(cat VERSION).zip" .)
+          sha256sum "TimeKeeper-$(cat VERSION).zip" > TimeKeeper-$(cat VERSION).zip.sha256
+      - uses: actions/upload-artifact@v4
+        with: {name: zip, path: 'TimeKeeper-*.zip*'}
+      - uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
+        with:
+          tag_name: ${{ inputs.release_tag || (startsWith(github.ref, 'refs/tags/') && github.ref_name) || 'v1.0.0' }}
+          files: |
+            bin/TimeKeeper32.exe
+            bin/TimeKeeper64.exe

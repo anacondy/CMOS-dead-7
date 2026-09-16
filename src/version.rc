@@ -1,0 +1,60 @@
+/* version.rc — VERSIONINFO + embedded application manifest.
+ *
+ * Processed by the preprocessor by both rc.exe (MSVC) and windres (MinGW), so
+ * config.h is the single source of truth for version and product name here too.
+ *
+ * SPDX-License-Identifier: MIT
+ */
+#include <windows.h>
+#include "config.h"
+
+#define TK_STR2(x) #x
+#define TK_STR(x)  TK_STR2(x)
+
+#define TK_FILEVER  TK_VERSION_MAJOR,TK_VERSION_MINOR,TK_VERSION_PATCH,0
+#define TK_PRODVER  TK_VERSION_MAJOR,TK_VERSION_MINOR,TK_VERSION_PATCH,0
+#define TK_VERSTR   TK_STR(TK_VERSION_MAJOR) "." TK_STR(TK_VERSION_MINOR) "." TK_STR(TK_VERSION_PATCH)
+
+/* NOTE: FILEVERSION / PRODUCTVERSION are keywords in the RC grammar, so they
+ * cannot be used as macro names here (windres rejects that, rc.exe tolerates it
+ * by accident). Spelling the numeric lists out keeps both compilers happy. */
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION  TK_FILEVER
+ PRODUCTVERSION TK_FILEVER
+ FILEFLAGSMASK 0x3fL
+ FILEFLAGS 0x0L
+ FILEOS 0x40004L
+ FILETYPE 0x1L
+ FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "CompanyName",      "TimeKeeper Project\0"
+            VALUE "FileDescription",  "One-shot system clock correction for Windows 7 (dead CMOS battery)\0"
+            VALUE "FileVersion",      TK_VERSTR "\0"
+            VALUE "InternalName",     "TimeKeeper\0"
+            VALUE "LegalCopyright",   "MIT License - Copyright (c) 2026 TimeKeeper contributors\0"
+            VALUE "OriginalFilename", "TimeKeeper.exe\0"
+            VALUE "ProductName",      "TimeKeeper\0"
+            VALUE "ProductVersion",   TK_VERSTR "\0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END
+
+/* ------------------------------------------------------------------ manifest */
+/* requireAdministrator is deliberate even though the shipped task runs as
+ * SYSTEM: with asInvoker, a manual double-click would "succeed" silently and
+ * set nothing. UAC-on installs also get the expected prompt.
+ *
+ * RT_MANIFEST is 24 and CREATEPROCESS_MANIFEST_RESOURCE_ID is 1; both are
+ * spelled numerically because rc.exe and windres disagree on which of the two
+ * symbolic names they provide. The build stages app.manifest next to this file
+ * (see Makefile.mingw / CMakeLists.txt) so the relative path resolves under
+ * either compiler: RC looks next to the .rc, windres in the current directory. */
+1 24 "app.manifest"
