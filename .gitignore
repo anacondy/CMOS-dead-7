@@ -1,0 +1,10 @@
+# Regenerable build output; final Windows binaries are published as release assets.
+build/
+*.o
+*.obj
+*.res
+*.exe
+*.ilk
+*.pdb
+win/
+dist/
