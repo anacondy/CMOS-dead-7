@@ -29,9 +29,9 @@
 /* The bump target. The GitHub Action rewrites this one line (and TimeKeeper.dat)
  * on the 1st of each month, so a fresh clone carries a recent default.
  * Keep both forms in sync; the action does, and /test validates the string. */
-#define TK_FALLBACK_DATE "2026-09-01"
+#define TK_FALLBACK_DATE "2026-10-01"
 #define TK_FALLBACK_YEAR  2026
-#define TK_FALLBACK_MONTH 9
+#define TK_FALLBACK_MONTH 10
 #define TK_FALLBACK_DAY   1
 
 /* ----------------------------------------------------------------- layout ---- */
